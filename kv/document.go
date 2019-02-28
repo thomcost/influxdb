@@ -3,6 +3,7 @@ package kv
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"path"
 
 	"github.com/influxdata/influxdb"
@@ -73,10 +74,188 @@ type DocumentStore struct {
 	namespace string
 }
 
-func (s *DocumentStore) CreateDocument(ctx context.Context, d *influxdb.Document) error {
+func (s *DocumentStore) CreateDocument(ctx context.Context, d *influxdb.Document, opts ...influxdb.DocumentCreateOptions) error {
 	return s.service.kv.Update(func(tx Tx) error {
-		return s.service.createDocument(ctx, tx, s.namespace, d)
+		err := s.service.createDocument(ctx, tx, s.namespace, d)
+		if err != nil {
+			return err
+		}
+
+		idx := &DocumentIndex{
+			service: s.service,
+			tx:      tx,
+			ctx:     ctx,
+		}
+		for _, opt := range opts {
+			if err := opt(d.ID, idx); err != nil {
+				return err
+			}
+		}
+
+		return nil
 	})
+}
+
+type DocumentIndex struct {
+	service *Service
+	ctx     context.Context
+	tx      Tx
+}
+
+func (i *DocumentIndex) AddDocumentOwner(id influxdb.ID, ownerType string, ownerID influxdb.ID) error {
+	if err := i.ownerExists(ownerType, ownerID); err != nil {
+		return err
+	}
+
+	m := &influxdb.UserResourceMapping{
+		UserID:       ownerID,
+		UserType:     influxdb.Owner,
+		ResourceType: influxdb.DocumentsResourceType,
+		ResourceID:   id,
+	}
+	return i.service.createUserResourceMapping(i.ctx, i.tx, m)
+}
+
+func (i *DocumentIndex) UsersOrgs(userID influxdb.ID) ([]influxdb.ID, error) {
+	f := influxdb.UserResourceMappingFilter{
+		UserID:       userID,
+		UserType:     influxdb.Owner,
+		ResourceType: influxdb.OrgsResourceType,
+	}
+
+	ms, err := i.service.findUserResourceMappings(i.ctx, i.tx, f)
+	if err != nil {
+		return nil, err
+	}
+
+	ids := make([]influxdb.ID, 0, len(ms))
+	for _, m := range ms {
+		ids = append(ids, m.ResourceID)
+	}
+
+	return ids, nil
+}
+
+func (i *DocumentIndex) IsOrgOwner(userID influxdb.ID, orgID influxdb.ID) error {
+	f := influxdb.UserResourceMappingFilter{
+		UserID:       userID,
+		ResourceType: influxdb.OrgsResourceType,
+		ResourceID:   orgID,
+	}
+
+	ms, err := i.service.findUserResourceMappings(i.ctx, i.tx, f)
+	if err != nil {
+		return err
+	}
+
+	for _, m := range ms {
+		if m.UserType == influxdb.Owner {
+			return nil
+		}
+	}
+
+	return &influxdb.Error{
+		Code: influxdb.EUnauthorized,
+		Msg:  "user is not org owner",
+	}
+}
+
+func (i *DocumentIndex) IsOrgMember(userID influxdb.ID, orgID influxdb.ID) error {
+	f := influxdb.UserResourceMappingFilter{
+		UserID:       userID,
+		ResourceType: influxdb.OrgsResourceType,
+		ResourceID:   orgID,
+	}
+
+	ms, err := i.service.findUserResourceMappings(i.ctx, i.tx, f)
+	if err != nil {
+		return err
+	}
+
+	for _, m := range ms {
+		switch m.UserType {
+		case influxdb.Owner, influxdb.Member:
+			return nil
+		default:
+			continue
+		}
+	}
+
+	return &influxdb.Error{
+		Code: influxdb.EUnauthorized,
+		Msg:  "user is not org member",
+	}
+}
+
+func (i *DocumentIndex) ownerExists(ownerType string, ownerID influxdb.ID) error {
+	switch ownerType {
+	case "org":
+		if _, err := i.service.findOrganizationByID(i.ctx, i.tx, ownerID); err != nil {
+			return err
+		}
+	case "user":
+		if _, err := i.service.findUserByID(i.ctx, i.tx, ownerID); err != nil {
+			return err
+		}
+	default:
+		return &influxdb.Error{
+			Code: influxdb.EInternal,
+			Msg:  fmt.Sprintf("unknown owner type %q", ownerType),
+		}
+	}
+
+	return nil
+}
+
+func (i *DocumentIndex) FindOrganizationByName(org string) (influxdb.ID, error) {
+	o, err := i.service.findOrganizationByName(i.ctx, i.tx, org)
+	if err != nil {
+		return influxdb.InvalidID(), err
+	}
+	return o.ID, nil
+}
+
+func (i *DocumentIndex) GetDocumentsOwners(docID influxdb.ID) ([]influxdb.ID, error) {
+	f := influxdb.UserResourceMappingFilter{
+		UserType:     influxdb.Owner,
+		ResourceType: influxdb.DocumentsResourceType,
+		ResourceID:   docID,
+	}
+	ms, err := i.service.findUserResourceMappings(i.ctx, i.tx, f)
+	if err != nil {
+		return nil, err
+	}
+
+	ids := make([]influxdb.ID, 0, len(ms))
+	for _, m := range ms {
+		// TODO(desa): this is really an orgID
+		ids = append(ids, m.UserID)
+	}
+
+	return ids, nil
+}
+
+func (i *DocumentIndex) GetOwnersDocuments(ownerType string, ownerID influxdb.ID) ([]influxdb.ID, error) {
+	if err := i.ownerExists(ownerType, ownerID); err != nil {
+		return nil, err
+	}
+
+	f := influxdb.UserResourceMappingFilter{
+		UserID:       ownerID,
+		UserType:     influxdb.Owner,
+		ResourceType: influxdb.DocumentsResourceType,
+	}
+	ms, err := i.service.findUserResourceMappings(i.ctx, i.tx, f)
+	if err != nil {
+		return nil, err
+	}
+
+	ids := make([]influxdb.ID, 0, len(ms))
+	for _, m := range ms {
+		ids = append(ids, m.ResourceID)
+	}
+
+	return ids, nil
 }
 
 func (s *Service) createDocument(ctx context.Context, tx Tx, ns string, d *influxdb.Document) error {
@@ -140,20 +319,33 @@ func (s *DocumentStore) FindDocumentsByID(ctx context.Context, ids ...influxdb.I
 	ds := make([]*influxdb.Document, 0, len(ids))
 
 	err := s.service.kv.View(func(tx Tx) error {
-		for _, id := range ids {
-			d, err := s.service.findDocumentByID(ctx, tx, s.namespace, id)
-			if err != nil {
-				return err
-			}
-
-			ds = append(ds, d)
+		docs, err := s.service.findDocumentsByID(ctx, tx, s.namespace, ids...)
+		if err != nil {
+			return err
 		}
+
+		ds = append(ds, docs...)
 
 		return nil
 	})
 
 	if err != nil {
 		return nil, err
+	}
+
+	return ds, nil
+}
+
+func (s *Service) findDocumentsByID(ctx context.Context, tx Tx, ns string, ids ...influxdb.ID) ([]*influxdb.Document, error) {
+	ds := make([]*influxdb.Document, 0, len(ids))
+
+	for _, id := range ids {
+		d, err := s.findDocumentByID(ctx, tx, ns, id)
+		if err != nil {
+			return nil, err
+		}
+
+		ds = append(ds, d)
 	}
 
 	return ds, nil
@@ -219,10 +411,32 @@ func (s *Service) findDocumentDataByID(ctx context.Context, tx Tx, ns string, id
 	return data, nil
 }
 
-func (s *DocumentStore) FindDocuments(ctx context.Context, opts influxdb.FindOptions) ([]*influxdb.Document, error) {
+func (s *DocumentStore) FindDocuments(ctx context.Context, opts ...influxdb.DocumentFindOptions) ([]*influxdb.Document, error) {
 	var ds []*influxdb.Document
 	err := s.service.kv.View(func(tx Tx) error {
-		return s.service.findDocuments(ctx, tx, s.namespace, &ds)
+		idx := &DocumentIndex{
+			service: s.service,
+			tx:      tx,
+		}
+
+		var ids []influxdb.ID
+		for _, opt := range opts {
+			is, err := opt(idx)
+			if err != nil {
+				return err
+			}
+
+			ids = append(ids, is...)
+		}
+
+		docs, err := s.service.findDocumentsByID(ctx, tx, s.namespace, ids...)
+		if err != nil {
+			return err
+		}
+
+		ds = append(ds, docs...)
+
+		return nil
 	})
 
 	if err != nil {
@@ -266,8 +480,24 @@ func (s *Service) findDocuments(ctx context.Context, tx Tx, ns string, ds *[]*in
 //	})
 //}
 
-func (s *DocumentStore) DeleteDocuments(ctx context.Context, ids ...influxdb.ID) error {
+func (s *DocumentStore) DeleteDocuments(ctx context.Context, opts ...influxdb.DocumentFindOptions) error {
 	return s.service.kv.Update(func(tx Tx) error {
+		idx := &DocumentIndex{
+			service: s.service,
+			tx:      tx,
+			ctx:     ctx,
+		}
+
+		ids := []influxdb.ID{}
+		for _, opt := range opts {
+			dids, err := opt(idx)
+			if err != nil {
+				return err
+			}
+
+			ids = append(ids, dids...)
+		}
+
 		for _, id := range ids {
 			if err := s.service.deleteDocument(ctx, tx, s.namespace, id); err != nil {
 				return err

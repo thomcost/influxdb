@@ -6,6 +6,7 @@ import (
 	"net/http"
 
 	"github.com/influxdata/influxdb"
+	pcontext "github.com/influxdata/influxdb/context"
 	"github.com/julienschmidt/httprouter"
 	"go.uber.org/zap"
 )
@@ -41,6 +42,7 @@ const (
 	documentsNamespaceIDPath = "/api/v2/documents/:ns/:id"
 )
 
+// TODO(desa): this should probably take a namespace
 // NewDocumentHandler returns a new instance of DocumentHandler.
 func NewDocumentHandler(b *DocumentBackend) *DocumentHandler {
 	h := &DocumentHandler{
@@ -50,7 +52,7 @@ func NewDocumentHandler(b *DocumentBackend) *DocumentHandler {
 		DocumentService: b.DocumentService,
 	}
 
-	h.HandlerFunc("POST", documentsPath, h.handlePostDocuments)
+	//h.HandlerFunc("POST", documentsPath, h.handlePostDocuments)
 	h.HandlerFunc("POST", documentsNamespacePath, h.handlePostDocument)
 	h.HandlerFunc("GET", documentsNamespacePath, h.handleGetDocuments)
 	h.HandlerFunc("GET", documentsNamespaceIDPath, h.handleGetDocument)
@@ -58,39 +60,40 @@ func NewDocumentHandler(b *DocumentBackend) *DocumentHandler {
 	return h
 }
 
-// handlePostDocument is the HTTP handler for the POST /api/v2/documents route.
-func (h *DocumentHandler) handlePostDocuments(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-
-	req, err := decodePostDocumentsRequest(ctx, r)
-	if err != nil {
-		EncodeError(ctx, err, w)
-		return
-	}
-
-	if _, err := h.DocumentService.CreateDocumentStore(ctx, req.Namespace); err != nil {
-		EncodeError(ctx, err, w)
-		return
-	}
-
-	if err := encodeResponse(ctx, w, http.StatusCreated, req); err != nil {
-		logEncodingError(h.Logger, r, err)
-		return
-	}
-}
-
-type postDocumentsRequest struct {
-	Namespace string `json:"namespace"`
-}
-
-func decodePostDocumentsRequest(ctx context.Context, r *http.Request) (*postDocumentsRequest, error) {
-	req := &postDocumentsRequest{}
-	if err := json.NewDecoder(r.Body).Decode(req); err != nil {
-		return nil, err
-	}
-
-	return req, nil
-}
+// TODO(desa): we probably shouldn't expose this
+//// handlePostDocument is the HTTP handler for the POST /api/v2/documents route.
+//func (h *DocumentHandler) handlePostDocuments(w http.ResponseWriter, r *http.Request) {
+//	ctx := r.Context()
+//
+//	req, err := decodePostDocumentsRequest(ctx, r)
+//	if err != nil {
+//		EncodeError(ctx, err, w)
+//		return
+//	}
+//
+//	if _, err := h.DocumentService.CreateDocumentStore(ctx, req.Namespace); err != nil {
+//		EncodeError(ctx, err, w)
+//		return
+//	}
+//
+//	if err := encodeResponse(ctx, w, http.StatusCreated, req); err != nil {
+//		logEncodingError(h.Logger, r, err)
+//		return
+//	}
+//}
+//
+//type postDocumentsRequest struct {
+//	Namespace string `json:"namespace"`
+//}
+//
+//func decodePostDocumentsRequest(ctx context.Context, r *http.Request) (*postDocumentsRequest, error) {
+//	req := &postDocumentsRequest{}
+//	if err := json.NewDecoder(r.Body).Decode(req); err != nil {
+//		return nil, err
+//	}
+//
+//	return req, nil
+//}
 
 // handlePostDocument is the HTTP handler for the POST /api/v2/documents/:ns route.
 func (h *DocumentHandler) handlePostDocument(w http.ResponseWriter, r *http.Request) {
@@ -108,7 +111,7 @@ func (h *DocumentHandler) handlePostDocument(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
-	if err := s.CreateDocument(ctx, req.Document); err != nil {
+	if err := s.CreateDocument(ctx, req.Document, influxdb.WithOrg(req.Org)); err != nil {
 		EncodeError(ctx, err, w)
 		return
 	}
@@ -120,29 +123,27 @@ func (h *DocumentHandler) handlePostDocument(w http.ResponseWriter, r *http.Requ
 }
 
 type postDocumentRequest struct {
-	Namespace string
-	Document  *influxdb.Document
+	*influxdb.Document
+	Namespace string `json:"-"`
+	Org       string `json:"org"`
 }
 
 func decodePostDocumentRequest(ctx context.Context, r *http.Request) (*postDocumentRequest, error) {
-	doc := &influxdb.Document{}
-	if err := json.NewDecoder(r.Body).Decode(doc); err != nil {
+	req := &postDocumentRequest{}
+	if err := json.NewDecoder(r.Body).Decode(req); err != nil {
 		return nil, err
 	}
 
 	params := httprouter.ParamsFromContext(ctx)
-	ns := params.ByName("ns")
-	if ns == "" {
+	req.Namespace = params.ByName("ns")
+	if req.Namespace == "" {
 		return nil, &influxdb.Error{
 			Code: influxdb.EInvalid,
 			Msg:  "url missing namespace",
 		}
 	}
 
-	return &postDocumentRequest{
-		Namespace: ns,
-		Document:  doc,
-	}, nil
+	return req, nil
 }
 
 // handleGetDocuments is the HTTP handler for the GET /api/v2/documents/:ns route.
@@ -161,7 +162,19 @@ func (h *DocumentHandler) handleGetDocuments(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
-	ds, err := s.FindDocuments(ctx, influxdb.FindOptions{})
+	a, err := pcontext.GetAuthorizer(ctx)
+	if err != nil {
+		EncodeError(ctx, err, w)
+		return
+	}
+
+	opt := influxdb.AuthorizedWhere(a)
+
+	if req.Org != "" {
+		opt = influxdb.AuthorizedWhereOrg(a, req.Org)
+	}
+
+	ds, err := s.FindDocuments(ctx, opt)
 	if err != nil {
 		EncodeError(ctx, err, w)
 		return
@@ -175,6 +188,7 @@ func (h *DocumentHandler) handleGetDocuments(w http.ResponseWriter, r *http.Requ
 
 type getDocumentsRequest struct {
 	Namespace string
+	Org       string
 }
 
 func decodeGetDocumentsRequest(ctx context.Context, r *http.Request) (*getDocumentsRequest, error) {
@@ -187,8 +201,10 @@ func decodeGetDocumentsRequest(ctx context.Context, r *http.Request) (*getDocume
 		}
 	}
 
+	qp := r.URL.Query()
 	return &getDocumentsRequest{
 		Namespace: ns,
+		Org:       qp.Get("org"),
 	}, nil
 }
 
@@ -208,13 +224,19 @@ func (h *DocumentHandler) handleGetDocument(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
-	d, err := s.FindDocumentsByID(ctx, req.ID)
+	a, err := pcontext.GetAuthorizer(ctx)
 	if err != nil {
 		EncodeError(ctx, err, w)
 		return
 	}
 
-	if err := encodeResponse(ctx, w, http.StatusOK, d); err != nil {
+	ds, err := s.FindDocuments(ctx, influxdb.AuthorizedWhereID(a, req.ID))
+	if err != nil {
+		EncodeError(ctx, err, w)
+		return
+	}
+
+	if err := encodeResponse(ctx, w, http.StatusOK, ds); err != nil {
 		logEncodingError(h.Logger, r, err)
 		return
 	}
@@ -252,6 +274,73 @@ func decodeGetDocumentRequest(ctx context.Context, r *http.Request) (*getDocumen
 	}
 
 	return &getDocumentRequest{
+		Namespace: ns,
+		ID:        id,
+	}, nil
+}
+
+// handleDeleteDocument is the HTTP handler for the DELETE /api/v2/documents/:ns/:id route.
+func (h *DocumentHandler) handleDeleteDocument(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+
+	req, err := decodeDeleteDocumentRequest(ctx, r)
+	if err != nil {
+		EncodeError(ctx, err, w)
+		return
+	}
+
+	s, err := h.DocumentService.FindDocumentStore(ctx, req.Namespace)
+	if err != nil {
+		EncodeError(ctx, err, w)
+		return
+	}
+
+	a, err := pcontext.GetAuthorizer(ctx)
+	if err != nil {
+		EncodeError(ctx, err, w)
+		return
+	}
+
+	if err := s.DeleteDocuments(ctx, influxdb.AuthorizedWhereID(a, req.ID)); err != nil {
+		EncodeError(ctx, err, w)
+		return
+	}
+
+	w.WriteHeader(http.StatusNoContent)
+}
+
+type deleteDocumentRequest struct {
+	Namespace string
+	ID        influxdb.ID
+}
+
+func decodeDeleteDocumentRequest(ctx context.Context, r *http.Request) (*deleteDocumentRequest, error) {
+	params := httprouter.ParamsFromContext(ctx)
+	ns := params.ByName("ns")
+	if ns == "" {
+		return nil, &influxdb.Error{
+			Code: influxdb.EInvalid,
+			Msg:  "url missing namespace",
+		}
+	}
+
+	i := params.ByName("id")
+	if i == "" {
+		return nil, &influxdb.Error{
+			Code: influxdb.EInvalid,
+			Msg:  "url missing id",
+		}
+	}
+
+	var id influxdb.ID
+	if err := id.DecodeFromString(i); err != nil {
+		return nil, &influxdb.Error{
+			Code: influxdb.EInvalid,
+			Msg:  "bad id in url",
+		}
+	}
+
+	return &deleteDocumentRequest{
 		Namespace: ns,
 		ID:        id,
 	}, nil
